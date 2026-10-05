@@ -1,27 +1,34 @@
 services:
   - type: web
     name: high-sky-operations-portal
-    runtime: docker
-    plan: starter
+    runtime: python
+    plan: free
+    region: oregon
+    buildCommand: pip install -r requirements.txt
+    startCommand: python -m uvicorn app:app --host 0.0.0.0 --port $PORT
     healthCheckPath: /health
-    disk:
-      name: high-sky-data
-      mountPath: /data
-      sizeGB: 1
     envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.12
       - key: APP_ENV
         value: production
-      - key: ADMIN_EMAIL
-        value: admin@highsky.local
-      - key: ADMIN_PASSWORD
-        sync: false
+      - key: FREE_HOSTING
+        value: "1"
       - key: DATA_DIR
-        value: /data
-      - key: UPLOAD_DIR
-        value: /data/uploads
-      - key: DATABASE_PATH
-        value: /data/high_sky.db
+        value: /tmp/high-sky
       - key: SECRET_KEY
         generateValue: true
       - key: HTTPS_ONLY
         value: "1"
+      - key: ADMIN_EMAIL
+        value: admin@highsky.local
+      - key: ADMIN_PASSWORD
+        sync: false
+      - key: DATABASE_URL
+        sync: false
+      - key: SUPABASE_URL
+        value: https://uwujxghrrtujnxajyatr.supabase.co
+      - key: SUPABASE_SERVICE_KEY
+        sync: false
+      - key: SUPABASE_STORAGE_BUCKET
+        value: high-sky-documents

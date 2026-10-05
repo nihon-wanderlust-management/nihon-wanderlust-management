@@ -1,10 +1,12 @@
 import os, csv, re, io, sqlite3, hashlib, hmac, secrets, mimetypes, json
+import storage
+from database import PostgresConnection
 from pathlib import Path
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 from typing import Optional
 
 from fastapi import FastAPI, Request, Form, UploadFile, File, HTTPException
-from fastapi.responses import HTMLResponse, RedirectResponse, FileResponse, StreamingResponse, PlainTextResponse
+from fastapi.responses import HTMLResponse, RedirectResponse, FileResponse, StreamingResponse, PlainTextResponse, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from starlette.middleware.sessions import SessionMiddleware
@@ -12,12 +14,15 @@ from starlette.middleware.sessions import SessionMiddleware
 BASE = Path(__file__).resolve().parent
 DATA_DIR = Path(os.environ.get("DATA_DIR", BASE / "runtime"))
 UPLOAD_DIR = Path(os.environ.get("UPLOAD_DIR", DATA_DIR / "uploads"))
+DATABASE_URL = os.environ.get("DATABASE_URL", "")
 DB_PATH = Path(os.environ.get("DATABASE_PATH", DATA_DIR / "high_sky.db"))
 MAX_UPLOAD_MB = int(os.environ.get("MAX_UPLOAD_MB", "10"))
 PRODUCTION = os.environ.get("APP_ENV") == "production"
 SECRET_KEY = os.environ.get("SECRET_KEY") or "dev-only-change-this-secret"
 if PRODUCTION and SECRET_KEY == "dev-only-change-this-secret":
     raise RuntimeError("Set SECRET_KEY before starting the production portal")
+if PRODUCTION and os.environ.get("FREE_HOSTING") == "1" and (not DATABASE_URL or not storage.configured()):
+    raise RuntimeError("Free hosting requires an external database and private document storage")
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -37,6 +42,8 @@ templates = Jinja2Templates(directory=str(BASE / "templates"))
 
 
 def db():
+    if DATABASE_URL:
+        return PostgresConnection(DATABASE_URL)
     con = sqlite3.connect(DB_PATH)
     con.row_factory = sqlite3.Row
     con.execute("PRAGMA foreign_keys=ON")
@@ -62,7 +69,10 @@ def verify_password(password: str, encoded: str) -> bool:
 
 
 def ensure_column(con, table: str, column: str, definition: str):
-    cols={r["name"] for r in con.execute(f"PRAGMA table_info({table})").fetchall()}
+    if DATABASE_URL:
+        cols = {r["name"] for r in con.execute("SELECT column_name AS name FROM information_schema.columns WHERE table_schema='high_sky' AND table_name=?", (table,)).fetchall()}
+    else:
+        cols={r["name"] for r in con.execute(f"PRAGMA table_info({table})").fetchall()}
     if column not in cols:
         con.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
 
@@ -75,6 +85,8 @@ def set_setting(con, key: str, value: str):
 
 def init_db():
     con = db(); c = con.cursor()
+    if DATABASE_URL:
+        c.execute("CREATE SCHEMA IF NOT EXISTS high_sky")
     c.executescript('''
     CREATE TABLE IF NOT EXISTS users(
       id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, email TEXT UNIQUE NOT NULL,
@@ -210,6 +222,14 @@ def init_db():
           ("Hotel / Agent","AGENT","Hotel/Agent",0.0,10.0,1,"Hotel desk, travel agent or concierge booking."),
           ("Corporate","CORP","Corporate",0.0,10.0,1,"Company or group account booking."),
           ("Other","OTHER","Other",0.0,10.0,1,"Custom source.")])
+    if DATABASE_URL:
+        for table in ("users", "vehicles", "bookings", "booking_staff", "expenses", "booking_documents", "incidents", "audit_log", "payment_batches", "payment_lines", "sales_channels", "booking_finance", "system_settings"):
+            c.execute(f"ALTER TABLE {table} ENABLE ROW LEVEL SECURITY")
+            c.execute(f"REVOKE ALL ON {table} FROM PUBLIC")
+        for definition in ["booking_staff(user_id, booking_id)", "expenses(booking_id)", "booking_documents(booking_id)", "payment_lines(batch_id)", "bookings(service_datetime)"]:
+            table = definition.split('(')[0]
+            suffix = definition.split('(')[1].split(')')[0].replace(', ', '_')
+            c.execute(f"CREATE INDEX IF NOT EXISTS idx_{table}_{suffix} ON {definition}")
     con.commit(); con.close()
 
 
@@ -349,13 +369,16 @@ async def save_upload(file: UploadFile, prefix: str="doc"):
     if mime not in ALLOWED_MIME_PREFIXES:
         raise HTTPException(400, "File content type is not allowed.")
     stored = f"{prefix}_{safe_upload_name(original)}"
-    target = UPLOAD_DIR / stored
-    with open(target, "wb") as out: out.write(content)
-    if not target.exists() or target.stat().st_size != len(content):
-        raise HTTPException(500, "Upload could not be saved correctly.")
+    storage.save(stored, content, mime, UPLOAD_DIR)
     return {"stored": stored, "original": original, "mime": mime, "size": len(content)}
 
 
+
+
+def document_response(stored, mime, original):
+    from urllib.parse import quote
+    content = storage.read(stored, UPLOAD_DIR)
+    return Response(content, media_type=mime or "application/octet-stream", headers={"Content-Disposition": "inline; filename*=UTF-8''" + quote(original, safe=''), "Cache-Control": "private, no-store", "X-Content-Type-Options": "nosniff"})
 
 
 def normalize_header(v: str) -> str:
@@ -524,7 +547,7 @@ def reconcile_payment_batch(con, batch_id:int, source:str, period_start:str, per
                 con.execute("UPDATE booking_finance SET "+",".join(updates)+" WHERE booking_id=?",vals)
         con.execute("""INSERT INTO payment_lines(batch_id,booking_ref,booking_id,paid_amount,expected_amount,currency,variance,reconciliation_status,raw_text,occurrence_no)
                      VALUES(?,?,?,?,?,?,?,?,?,?)""",(batch_id,ref,bid,paid,expected,currency,variance,status,row.get("raw_text",""),occ))
-    expected_rows=con.execute("""SELECT * FROM bookings WHERE source=? AND date(service_datetime)>=date(?) AND date(service_datetime)<=date(?) ORDER BY service_datetime""",(source,period_start,period_end)).fetchall()
+    expected_rows=con.execute("""SELECT * FROM bookings WHERE source=? AND substr(service_datetime,1,10)>=? AND substr(service_datetime,1,10)<=? ORDER BY service_datetime""",(source,period_start,period_end)).fetchall()
     expected_total=0.0
     for b in expected_rows:
         finance=ensure_booking_finance(con,b["id"]); expected=float(finance["expected_payout"] if finance else (b["net_price"] or 0))
@@ -548,11 +571,14 @@ def startup():
 def health():
     try:
         con=db(); con.execute("SELECT 1").fetchone(); con.close()
-        test = UPLOAD_DIR / ".write_test"
-        test.write_text("ok", encoding="utf-8"); test.unlink()
+        if storage.configured():
+            storage.healthy()
+        else:
+            test = UPLOAD_DIR / ".write_test"
+            test.write_text("ok", encoding="utf-8"); test.unlink()
         return "OK database=ok uploads=ok"
-    except Exception as e:
-        raise HTTPException(503, f"Health check failed: {e}")
+    except Exception:
+        raise HTTPException(503, "Database or document storage is temporarily unavailable")
 
 
 @app.get("/login", response_class=HTMLResponse)
@@ -578,11 +604,11 @@ def dashboard(request: Request):
     if x: return x
     con=db(); role=request.session["role"]; uid=request.session["user_id"]
     if role in ("driver","guide"):
-        upcoming=con.execute('''SELECT b.*,v.name vehicle_name,bs.acceptance_status FROM bookings b JOIN booking_staff bs ON bs.booking_id=b.id LEFT JOIN vehicles v ON v.id=b.vehicle_id WHERE bs.user_id=? AND datetime(b.service_datetime)>=datetime('now','-1 day') ORDER BY b.service_datetime LIMIT 12''',(uid,)).fetchall()
+        upcoming=con.execute('''SELECT b.*,v.name vehicle_name,bs.acceptance_status FROM bookings b JOIN booking_staff bs ON bs.booking_id=b.id LEFT JOIN vehicles v ON v.id=b.vehicle_id WHERE bs.user_id=? AND b.service_datetime >= ? ORDER BY b.service_datetime LIMIT 12''',(uid,(datetime.utcnow().replace(microsecond=0) - timedelta(days=1)).strftime('%Y-%m-%d %H:%M'))).fetchall()
         stats={"assigned":con.execute("SELECT COUNT(*) n FROM booking_staff WHERE user_id=?",(uid,)).fetchone()["n"],"pending_acceptance":con.execute("SELECT COUNT(*) n FROM booking_staff WHERE user_id=? AND acceptance_status='Pending'",(uid,)).fetchone()["n"],"pending_expenses":con.execute("SELECT COALESCE(SUM(amount),0) n FROM expenses WHERE user_id=? AND status IN ('Submitted','Approved')",(uid,)).fetchone()["n"],"paid_expenses":con.execute("SELECT COALESCE(SUM(amount),0) n FROM expenses WHERE user_id=? AND status='Paid'",(uid,)).fetchone()["n"]}
     else:
-        upcoming=con.execute('''SELECT b.*,v.name vehicle_name,GROUP_CONCAT(u.name, ', ') assigned_names FROM bookings b LEFT JOIN vehicles v ON v.id=b.vehicle_id LEFT JOIN booking_staff bs ON bs.booking_id=b.id LEFT JOIN users u ON u.id=bs.user_id WHERE b.archived=0 AND datetime(b.service_datetime)>=datetime('now','-1 day') GROUP BY b.id ORDER BY b.service_datetime LIMIT 12''').fetchall()
-        stats={"bookings":con.execute("SELECT COUNT(*) n FROM bookings WHERE archived=0").fetchone()["n"],"upcoming":con.execute("SELECT COUNT(*) n FROM bookings WHERE archived=0 AND datetime(service_datetime)>=datetime('now')").fetchone()["n"],"revenue":con.execute("SELECT COALESCE(SUM(net_price),0) n FROM bookings").fetchone()["n"],"pending_expenses":con.execute("SELECT COALESCE(SUM(amount),0) n FROM expenses WHERE status IN ('Submitted','Approved')").fetchone()["n"],"unassigned":con.execute("SELECT COUNT(*) n FROM bookings b WHERE NOT EXISTS (SELECT 1 FROM booking_staff bs WHERE bs.booking_id=b.id)").fetchone()["n"]}
+        upcoming=con.execute('''SELECT b.*,v.name vehicle_name,(SELECT GROUP_CONCAT(u2.name, ', ') FROM booking_staff bs2 JOIN users u2 ON u2.id=bs2.user_id WHERE bs2.booking_id=b.id) assigned_names FROM bookings b LEFT JOIN vehicles v ON v.id=b.vehicle_id WHERE b.archived=0 AND b.service_datetime >= ? ORDER BY b.service_datetime LIMIT 12''', ((datetime.utcnow() - timedelta(days=1)).strftime('%Y-%m-%d %H:%M'),)).fetchall()
+        stats={"bookings":con.execute("SELECT COUNT(*) n FROM bookings WHERE archived=0").fetchone()["n"],"upcoming":con.execute("SELECT COUNT(*) n FROM bookings WHERE archived=0 AND service_datetime >= ?", (datetime.utcnow().strftime('%Y-%m-%d %H:%M'),)).fetchone()["n"],"revenue":con.execute("SELECT COALESCE(SUM(net_price),0) n FROM bookings").fetchone()["n"],"pending_expenses":con.execute("SELECT COALESCE(SUM(amount),0) n FROM expenses WHERE status IN ('Submitted','Approved')").fetchone()["n"],"unassigned":con.execute("SELECT COUNT(*) n FROM bookings b WHERE NOT EXISTS (SELECT 1 FROM booking_staff bs WHERE bs.booking_id=b.id)").fetchone()["n"]}
     con.close(); return templates.TemplateResponse("dashboard.html",ctx(request,upcoming=upcoming,stats=stats))
 
 @app.get("/bookings", response_class=HTMLResponse)
@@ -590,14 +616,14 @@ def bookings(request: Request, q: str=""):
     x=require_login(request)
     if x:return x
     con=db(); role=request.session["role"]
-    base='''SELECT b.*,v.name vehicle_name,GROUP_CONCAT(u.name, ', ') assigned_names FROM bookings b LEFT JOIN vehicles v ON v.id=b.vehicle_id LEFT JOIN booking_staff bs ON bs.booking_id=b.id LEFT JOIN users u ON u.id=bs.user_id'''
+    base='''SELECT b.*,v.name vehicle_name,(SELECT GROUP_CONCAT(u2.name, ', ') FROM booking_staff bs2 JOIN users u2 ON u2.id=bs2.user_id WHERE bs2.booking_id=b.id) assigned_names FROM bookings b LEFT JOIN vehicles v ON v.id=b.vehicle_id'''
     params=[]; where=['b.archived=0']
     if role in ("driver","guide"):
         where.append("EXISTS(SELECT 1 FROM booking_staff x WHERE x.booking_id=b.id AND x.user_id=?)"); params.append(request.session["user_id"])
     if q:
         where.append("(b.booking_ref LIKE ? OR b.traveler_name LIKE ? OR b.product LIKE ?)"); params += [f"%{q}%"]*3
     if where: base += " WHERE " + " AND ".join(where)
-    base += " GROUP BY b.id ORDER BY b.service_datetime DESC LIMIT 500"
+    base += " ORDER BY b.service_datetime DESC LIMIT 500"
     rows=con.execute(base,params).fetchall(); channels=con.execute("SELECT * FROM sales_channels WHERE active=1 ORDER BY name").fetchall(); con.close()
     return templates.TemplateResponse("bookings.html",ctx(request,rows=rows,q=q,channels=channels))
 
@@ -686,9 +712,9 @@ def document_download(request:Request,did:int):
     con=db(); d=con.execute("SELECT * FROM booking_documents WHERE id=?",(did,)).fetchone()
     if not d: con.close(); raise HTTPException(404)
     if not staff_can_access_booking(con,request,d["booking_id"]): con.close(); raise HTTPException(403)
-    con.close(); p=UPLOAD_DIR/d["stored_filename"]
-    if not p.exists(): raise HTTPException(404,"Stored file missing")
-    return FileResponse(p,media_type=d["mime_type"] or "application/octet-stream",filename=d["original_filename"],content_disposition_type="inline")
+    con.close()
+    return document_response(d["stored_filename"],d["mime_type"],d["original_filename"])
+
 
 @app.get("/expenses", response_class=HTMLResponse)
 def expenses_get(request:Request):
@@ -720,9 +746,9 @@ def receipt_view(request:Request,eid:int):
     con=db(); e=con.execute("SELECT * FROM expenses WHERE id=?",(eid,)).fetchone()
     if not e or not e["receipt_file"]: con.close(); raise HTTPException(404)
     if request.session["role"] in ("driver","guide") and e["user_id"]!=request.session["user_id"]: con.close(); raise HTTPException(403)
-    con.close(); p=UPLOAD_DIR/e["receipt_file"]
-    if not p.exists(): raise HTTPException(404,"Stored receipt missing")
-    return FileResponse(p,media_type=e["receipt_mime"] or "application/octet-stream",filename=e["original_filename"] or p.name,content_disposition_type="inline")
+    con.close()
+    return document_response(e["receipt_file"],e["receipt_mime"],e["original_filename"] or e["receipt_file"])
+
 
 @app.post("/expenses/{eid}/review")
 def expense_review(request:Request,eid:int,status:str=Form(...),admin_note:str=Form("")):
@@ -787,9 +813,9 @@ async def payment_upload(request:Request, source:str=Form("GetYourGuide"), perio
     try: parsed=parse_payment_statement(statement.filename,raw)
     except ValueError as e:
         flash(request,str(e),"danger"); return RedirectResponse("/payments",303)
-    stored=f"payment_{safe_upload_name(statement.filename)}"; target=UPLOAD_DIR/stored; target.write_bytes(raw)
-    if not target.exists() or target.stat().st_size!=len(raw): raise HTTPException(500,"Payment statement could not be saved correctly.")
+    stored=f"payment_{safe_upload_name(statement.filename)}"
     mime=statement.content_type or mimetypes.guess_type(statement.filename)[0] or "application/octet-stream"
+    storage.save(stored, raw, mime, UPLOAD_DIR)
     con=db(); cur=con.execute("""INSERT INTO payment_batches(source,period_start,period_end,statement_date,currency,stored_filename,original_filename,mime_type,file_size,uploaded_by,notes)
                                VALUES(?,?,?,?,?,?,?,?,?,?,?)""",(source,period_start,period_end,statement_date or None,currency.upper(),stored,Path(statement.filename).name,mime,len(raw),request.session["user_id"],notes)); batch_id=cur.lastrowid
     result=reconcile_payment_batch(con,batch_id,source,period_start,period_end,currency.upper(),parsed); con.commit(); con.close()
@@ -813,9 +839,8 @@ def payment_statement_view(request:Request,batch_id:int):
     if x:return x
     con=db(); batch=con.execute("SELECT * FROM payment_batches WHERE id=?",(batch_id,)).fetchone(); con.close()
     if not batch: raise HTTPException(404)
-    p=UPLOAD_DIR/batch["stored_filename"]
-    if not p.exists(): raise HTTPException(404,"Stored payment statement missing")
-    return FileResponse(p,media_type=batch["mime_type"] or "application/octet-stream",filename=batch["original_filename"],content_disposition_type="inline")
+    return document_response(batch["stored_filename"],batch["mime_type"],batch["original_filename"])
+
 
 @app.get("/payments/{batch_id}/export.csv")
 def payment_export(request:Request,batch_id:int):
@@ -974,7 +999,7 @@ def admin_channel_full_edit(request:Request,cid:int,name:str=Form(...),code:str=
 def admin_settings_get(request:Request):
     x=require_role(request,"admin")
     if x:return x
-    con=db(); rows=con.execute("SELECT * FROM system_settings ORDER BY key").fetchall(); con.close(); return templates.TemplateResponse("settings.html",ctx(request,rows=rows,data_dir=str(DATA_DIR),upload_dir=str(UPLOAD_DIR),db_path=str(DB_PATH)))
+    con=db(); rows=con.execute("SELECT * FROM system_settings ORDER BY key").fetchall(); con.close(); return templates.TemplateResponse("settings.html",ctx(request,rows=rows,data_dir=str(DATA_DIR),upload_dir="Private Supabase Storage" if storage.configured() else str(UPLOAD_DIR),db_path="Managed PostgreSQL" if DATABASE_URL else str(DB_PATH)))
 
 @app.post("/settings")
 def admin_settings_save(request:Request,company_name:str=Form(...),company_phone:str=Form(""),company_email:str=Form(""),default_vat_rate:float=Form(10)):
@@ -992,7 +1017,7 @@ def admin_archived(request:Request):
 def reports(request:Request):
     x=require_role(request,"admin","operations","accountant","viewer")
     if x:return x
-    con=db(); by_product=con.execute("SELECT product,COUNT(*) bookings,SUM(pax) guests,SUM(price) sales,SUM(net_price) net FROM bookings GROUP BY product ORDER BY bookings DESC").fetchall(); by_source=con.execute("SELECT source,COUNT(*) bookings,SUM(net_price) net FROM bookings GROUP BY source").fetchall(); by_month=con.execute("SELECT substr(service_datetime,1,7) month,COUNT(*) bookings,SUM(pax) guests,SUM(net_price) net FROM bookings GROUP BY month ORDER BY month DESC").fetchall(); exp=con.execute("SELECT category,currency,COUNT(*) claims,SUM(amount) amount FROM expenses WHERE status IN ('Approved','Paid') GROUP BY category,currency").fetchall(); profitability=con.execute("SELECT b.*,COALESCE((SELECT SUM(e.amount) FROM expenses e WHERE e.booking_id=b.id AND e.currency='BHD' AND e.status IN ('Approved','Paid')),0) approved_expenses_bhd FROM bookings b ORDER BY b.service_datetime DESC LIMIT 200").fetchall(); con.close(); return templates.TemplateResponse("reports.html",ctx(request,by_product=by_product,by_source=by_source,by_month=by_month,exp=exp,profitability=profitability))
+    con=db(); by_product=con.execute("SELECT product,COUNT(*) bookings,SUM(pax) guests,SUM(price) sales,SUM(net_price) net FROM bookings GROUP BY product ORDER BY bookings DESC").fetchall(); by_source=con.execute("SELECT source,COUNT(*) bookings,SUM(net_price) net FROM bookings GROUP BY source").fetchall(); by_month=con.execute("SELECT substr(service_datetime,1,7) AS \"month\",COUNT(*) bookings,SUM(pax) guests,SUM(net_price) net FROM bookings GROUP BY substr(service_datetime,1,7) ORDER BY substr(service_datetime,1,7) DESC").fetchall(); exp=con.execute("SELECT category,currency,COUNT(*) claims,SUM(amount) amount FROM expenses WHERE status IN ('Approved','Paid') GROUP BY category,currency").fetchall(); profitability=con.execute("SELECT b.*,COALESCE((SELECT SUM(e.amount) FROM expenses e WHERE e.booking_id=b.id AND e.currency='BHD' AND e.status IN ('Approved','Paid')),0) approved_expenses_bhd FROM bookings b ORDER BY b.service_datetime DESC LIMIT 200").fetchall(); con.close(); return templates.TemplateResponse("reports.html",ctx(request,by_product=by_product,by_source=by_source,by_month=by_month,exp=exp,profitability=profitability))
 
 @app.get("/export/bookings.csv")
 def export_bookings(request:Request):
