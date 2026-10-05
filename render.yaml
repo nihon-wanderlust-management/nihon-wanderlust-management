@@ -1,0 +1,27 @@
+services:
+  - type: web
+    name: high-sky-operations-portal
+    runtime: docker
+    plan: starter
+    healthCheckPath: /health
+    disk:
+      name: high-sky-data
+      mountPath: /data
+      sizeGB: 1
+    envVars:
+      - key: APP_ENV
+        value: production
+      - key: ADMIN_EMAIL
+        value: admin@highsky.local
+      - key: ADMIN_PASSWORD
+        sync: false
+      - key: DATA_DIR
+        value: /data
+      - key: UPLOAD_DIR
+        value: /data/uploads
+      - key: DATABASE_PATH
+        value: /data/high_sky.db
+      - key: SECRET_KEY
+        generateValue: true
+      - key: HTTPS_ONLY
+        value: "1"

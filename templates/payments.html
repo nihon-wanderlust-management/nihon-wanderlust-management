@@ -1,0 +1,13 @@
+{% extends 'base.html' %}{% block title %}Payment Reconciliation{% endblock %}{% block content %}
+<div class="title"><div><h1>Payment Reconciliation</h1><p>Upload GetYourGuide, Viator, Klook or other OTA payout statements and compare them automatically with booking finance records.</p></div></div>
+<div class="grid2">
+<div class="panel"><h2>Upload payout statement</h2><form action="/payments/upload" method="post" enctype="multipart/form-data" class="formgrid">
+<label>Source<select name="source">{% for c in channels %}<option>{{c.name}}</option>{% endfor %}</select></label>
+<label>Period start<input type="date" name="period_start" required></label><label>Period end<input type="date" name="period_end" required></label>
+<label>Statement date<input type="date" name="statement_date"></label><label>Currency<select name="currency"><option>USD</option><option>BHD</option><option>EUR</option><option>GBP</option></select></label>
+<label class="full">Statement file<input type="file" name="statement" accept=".pdf,.csv,.tsv,.xlsx" required><small>CSV or Excel is best. Text based PDF is supported. The importer recognizes booking reference, payout, retail price, commission, adjustments and VAT on OTA services where available.</small></label>
+<label class="full">Notes<textarea name="notes" rows="2"></textarea></label><div class="full"><button class="btn" type="submit">Upload and reconcile</button></div></form></div>
+<div class="panel"><h2>Automatic checks</h2><ul class="clean"><li>Exact payment against expected payout</li><li>Short payment</li><li>Overpayment</li><li>Booking missing from statement</li><li>Unknown booking reference</li><li>Duplicate booking reference</li><li>Currency mismatch</li><li>Updates actual payout and accounts receivable</li><li>Captures OTA commission and VAT on OTA services where present</li></ul></div>
+</div>
+<div class="panel table"><h2>Previous payout statements</h2><table><thead><tr><th>ID</th><th>Period</th><th>Source</th><th>Expected</th><th>Paid</th><th>Variance</th><th>Status</th><th></th></tr></thead><tbody>{% for b in batches %}<tr><td>#{{b.id}}</td><td>{{b.period_start}} to {{b.period_end}}</td><td>{{b.source}}</td><td>{{'%.2f'|format(b.expected_total or 0)}} {{b.currency}}</td><td>{{'%.2f'|format(b.paid_total or 0)}} {{b.currency}}</td><td>{{'%.2f'|format(b.variance_total or 0)}} {{b.currency}}</td><td><span class="badge">{{b.status}}</span></td><td><a href="/payments/{{b.id}}">Open</a></td></tr>{% else %}<tr><td colspan="8">No payment statements uploaded yet.</td></tr>{% endfor %}</tbody></table></div>
+{% endblock %}

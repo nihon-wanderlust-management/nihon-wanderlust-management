@@ -1,0 +1,9 @@
+runtime/
+uploads/
+data/
+*.db
+*.db-*
+.env
+.env.*
+__pycache__/
+*.pyc

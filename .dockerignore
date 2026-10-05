@@ -1,0 +1,8 @@
+runtime
+uploads
+data
+*.db
+*.db-*
+.env*
+__pycache__
+.git

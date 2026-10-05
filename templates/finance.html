@@ -1,0 +1,13 @@
+{% extends 'base.html' %}{% block title %}Finance{% endblock %}{% block content %}
+<div class="title"><div><h1>Finance & VAT</h1><p>Customer sales, Bahrain VAT, OTA commissions, settlements and outstanding receivables.</p></div><div><a class="btn secondary" href="/finance/vat.csv">Export VAT & finance CSV</a></div></div>
+<div class="cards">
+<div class="card"><span>Gross sales</span><b>{{'%.2f'|format(totals.gross_sales or 0)}}</b></div>
+<div class="card"><span>Output VAT</span><b>{{'%.2f'|format(totals.output_vat or 0)}}</b></div>
+<div class="card"><span>OTA commission</span><b>{{'%.2f'|format(totals.ota_commission or 0)}}</b></div>
+<div class="card"><span>Expected payouts</span><b>{{'%.2f'|format(totals.expected_payout or 0)}}</b></div>
+<div class="card"><span>Actual payouts</span><b>{{'%.2f'|format(totals.actual_payout or 0)}}</b></div>
+<div class="card"><span>Receivable</span><b>{{'%.2f'|format(totals.receivable or 0)}}</b></div>
+</div>
+<div class="panel table"><h2>By sales channel</h2><table><thead><tr><th>Channel</th><th>Bookings</th><th>Gross sales</th><th>Output VAT</th><th>Commission</th><th>Expected payout</th><th>Actual payout</th><th>Receivable</th></tr></thead><tbody>{% for r in by_channel %}<tr><td><b>{{r.name}}</b><br><small>{{r.channel_type}}</small></td><td>{{r.bookings}}</td><td>{{'%.2f'|format(r.gross_sales or 0)}}</td><td>{{'%.2f'|format(r.output_vat or 0)}}</td><td>{{'%.2f'|format(r.commission or 0)}}</td><td>{{'%.2f'|format(r.expected_payout or 0)}}</td><td>{{'%.2f'|format(r.actual_payout or 0)}}</td><td>{{'%.2f'|format(r.receivable or 0)}}</td></tr>{% endfor %}</tbody></table></div>
+<div class="panel table"><h2>Booking finance register</h2><table><thead><tr><th>Date</th><th>Booking</th><th>Source</th><th>Gross</th><th>VAT</th><th>Commission</th><th>Expected</th><th>Paid</th><th>Balance</th><th>Status</th></tr></thead><tbody>{% for r in recent %}<tr><td>{{r.service_datetime}}</td><td><a href="/bookings/{{r.id}}">{{r.booking_ref}}</a></td><td>{{r.source}}</td><td>{{'%.2f'|format(r.retail_amount or 0)}} {{r.currency}}</td><td>{{'%.2f'|format(r.sales_vat_amount or 0)}}</td><td>{{'%.2f'|format(r.commission_amount or 0)}}</td><td>{{'%.2f'|format(r.expected_payout or 0)}}</td><td>{{'%.2f'|format(r.actual_payout or 0)}}</td><td>{{'%.2f'|format(r.receivable_balance or 0)}}</td><td><span class="badge">{{r.payment_status}}</span></td></tr>{% endfor %}</tbody></table></div>
+{% endblock %}
