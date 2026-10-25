@@ -201,11 +201,18 @@ def init_db():
             raise RuntimeError("Set ADMIN_PASSWORD to at least 12 characters for first deployment")
         demo = [("High Sky Admin", os.environ.get("ADMIN_EMAIL", "admin@highsky.local"), admin_password, "admin", "+973 35623237")]
         if not PRODUCTION:
-            for label, role in [("Operations User", "operations"), ("Accounts User", "accountant"), ("Demo Driver", "driver"), ("Demo Guide", "guide")]:
+            # Demo staff accounts. Passwords come from environment variables, never from code.
+            for label, role in [("Operations User", "operations"), ("Accounts User", "accountant"), ("Demo Guide", "guide")]:
                 password = os.environ.get(role.upper() + "_PASSWORD")
                 if password:
                     email = "accounts@highsky.local" if role == "accountant" else role + "@highsky.local"
                     demo.append((label, email, password, role, ""))
+            # Active drivers (replaces the old Demo Driver account). Set YASIR_PASSWORD / ARSLAN_PASSWORD to create them.
+            for label, env_key, email in [("Yasir Nazeer", "YASIR_PASSWORD", "yasir.nazeer@highsky.local"),
+                                          ("Arslan Haider", "ARSLAN_PASSWORD", "arslan.haider@highsky.local")]:
+                password = os.environ.get(env_key)
+                if password:
+                    demo.append((label, email, password, "driver", ""))
         for name,email,pw,role,phone in demo:
             c.execute("INSERT INTO users(name,email,password_hash,role,phone) VALUES(?,?,?,?,?)",(name,email,hash_password(pw),role,phone))
     if c.execute("SELECT COUNT(*) n FROM vehicles").fetchone()["n"] == 0:
